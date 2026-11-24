@@ -44,7 +44,7 @@ export async function importQuote(bytes, pricesOnly) {
     throw new InputError('invalid_workbook', { cause: error })
   }
   const sheet = book.worksheets[0]
-  if (!sheet || sheet.rowCount > 501 || sheet.columnCount > 35) throw new InputError('invalid_workbook')
+  if (!sheet || sheet.rowCount > 509 || sheet.columnCount > 35) throw new InputError('invalid_workbook')
   const headers = new Map()
   const headerRow = [1, 2].find(index => sheet.getRow(index).values.includes('施工项')) ?? 1
   sheet.getRow(headerRow).eachCell((cell, column) => headers.set(cell.text.trim(), column))
@@ -55,8 +55,9 @@ export async function importQuote(bytes, pricesOnly) {
   let afterTotal = false
   const exported = headerRow === 2 && sheet.getCell('B1').text === '报价版本'
   sheet.eachRow((row, index) => {
-    if (exported && index > headerRow && row.getCell(1).text === '合计') afterTotal = true
+    if (exported && index > headerRow && row.getCell(1).text === '合计' && row.getCell(3).value == null) afterTotal = true
     if (index <= headerRow || afterTotal) return
+    if (rows.length + problems.length >= 500) throw new InputError('invalid_workbook')
     const value = key => headers.has(key) ? row.getCell(headers.get(key)).text.trim() : ''
     try {
       const supply = value('供料')

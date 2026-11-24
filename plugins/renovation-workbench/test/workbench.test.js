@@ -205,6 +205,12 @@ test('chat tools read only owner uploads from the active session and save a vers
   try {
     const tools = new Map()
     const ref = { attachmentId: 'cad-upload', name: 'floor.dxf', bytes: dxf().length }
+    const book = new ExcelJS.Workbook()
+    const sheet = book.addWorksheet('报价')
+    sheet.addRow(['施工项', '数量', '单位', '单价'])
+    for (let n = 1; n <= 101; n++) sheet.addRow(['项目' + n, 1, '项', n])
+    const bytes = Buffer.from(await book.xlsx.writeBuffer())
+    const xlsx = { attachmentId: 'book', name: '项目.xlsx', bytes: bytes.length }
     const owner = { kind: 'user', rpcId: 'request' }
     const guest = { ...owner, principal: { kind: 'guest' } }
     const message = (source, attachment) => ({ type: 'user/message', data: {
@@ -213,14 +219,14 @@ test('chat tools read only owner uploads from the active session and save a vers
     const exec = source => ({
       callId: 'call-1', signal: new AbortController().signal, agent: { session: {
         id: 'test-session', inheritedEventCount: 0,
-        snapshotEvents: () => [message(owner, ref), { type: 'turn/start' }, message(source)],
+        snapshotEvents: () => [message(owner, ref), message(owner, xlsx), { type: 'turn/start' }, message(source)],
       } },
     })
     const dispose = registerChatTools({
       tools: { register: value => { tools.set(value.name, value); return () => tools.delete(value.name) } },
       systemPrompt: { section: () => () => {} },
       webServer: { getOrigin: () => 'http://127.0.0.1:39732' },
-      attachments: { async *readFileStream() { yield dxf() } },
+      attachments: { async *readFileStream(file) { yield file.attachmentId === 'book' ? bytes : dxf() } },
     }, store, {}, (run, signal) => run(signal))
     const inspect = tools.get('renovation_inspect_uploads')
     const generate = tools.get('renovation_generate_quote')
@@ -245,9 +251,42 @@ test('chat tools read only owner uploads from the active session and save a vers
     assert.equal(report.records.length, 1)
     assert.equal(report.records[0].lines[0].quantity, '12.0000')
     assert.equal(report.totals.agreed, null)
+    const anotherCall = callId => ({ ...exec(owner), callId })
+    const second = await generate.execute({ ...input, projectName: '乙工地' }, anotherCall('B'))
+    assert.notEqual(second.result.projectId, applied.result.projectId)
+    const existing = store.create({ name: '工作台项目' })
+    const matches = await inspect.execute({ projectName: existing.name }, exec(owner))
+    assert.equal(matches.result.projects[0].id, existing.id)
+    const revise = { ...input, projectName: existing.name, projectId: existing.id }
+    assert.equal((await generate.execute(revise, anotherCall('C'))).result.projectId, existing.id)
+    await generate.execute(revise, anotherCall('D'))
+    assert.deepEqual(store.records(existing.id).map(q => q.version), [1, 2])
+    assert.equal((await generate.execute({ ...input, projectName: existing.name }, anotherCall('E'))).code, 'project_selection_required')
+    const separate = await generate.execute({ ...input, createProject: true }, anotherCall('F'))
+    assert.notEqual(separate.result.projectId, applied.result.projectId)
+    const first = (await inspect.execute({ attachmentId: 'book' }, exec(owner))).result
+    const last = (await inspect.execute({ attachmentId: 'book', offset: first.nextOffset }, exec(owner))).result
+    assert.equal(first.totalRows, 101)
+    assert.equal(first.rows.length, 100)
+    assert.equal(last.truncated, false)
+    assert.equal(last.rows[0].name, '项目101')
+    const all = await generate.execute({ ...revise, lines: [...first.rows, ...last.rows] }, anotherCall('G'))
+    assert.equal(all.result.totalCents, 515100)
     dispose()
     assert.equal(tools.size, 0)
   } finally {
     store.close()
   }
+})
+
+test('a full budget workbook with terms round trips exactly 500 items', async () => {
+  const lines = Array.from({ length: 500 }, (_, i) => quoteLine({ ...line, name: i ? '施工项' + i : '合计' }))
+  const quote = { version: 1, tax: 'included', purpose: 'budget', totalCents: 51000000, lines,
+    scope: '地面', exclusions: '拆除', estimateTerms: '现场复量', paymentTerms: '分期', validUntil: date }
+  const view = { project: { name: '测试项目' } }
+  const result = await importQuote(await exportQuote(view, quote), false)
+  assert.equal(result.rows.length, 500)
+  assert.deepEqual(result.problems, [])
+  assert.equal(result.rows.at(-1).name, '施工项499')
+  await assert.rejects(importQuote(await exportQuote(view, { ...quote, lines: [...lines, lines[0]] }), false), /invalid_workbook/)
 })

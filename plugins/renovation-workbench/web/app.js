@@ -29,6 +29,7 @@ const errors = {
   ocr_unavailable: '此工作台尚未安装凭据识别，可直接手填',
   ocr_image_required: '请选择 PNG、JPEG 或 WebP 图片进行识别',
   ocr_failed: '未能识别这张凭据，请手填或换一张图片',
+  pending_operation: '上次提交结果待核对，请关闭表单，在项目页核对上次提交',
   operation_failed: '操作失败，请稍后重试', file_missing: '找不到当前项目的凭据',
 }
 let projects = []
@@ -75,7 +76,7 @@ async function api(path, params, data) {
   })
   if (response.status === 401) throw new Error('forbidden')
   const result = await response.json()
-  if (!response.ok) throw new Error(result.code)
+  if (!response.ok) throw Object.assign(new Error(result.code), { status: response.status })
   return result
 }
 
@@ -147,12 +148,54 @@ async function setProject(id) {
   render()
 }
 
+function pendingKey(route) {
+  return 'renovation-pending:' + (route === 'transfer' ? 'transfer' : view.project.id)
+}
+
+async function postMoney(route, input) {
+  const key = pendingKey(route)
+  const saved = sessionStorage.getItem(key)
+  const operation = saved ? JSON.parse(saved) : { input, id: crypto.randomUUID() }
+  if (JSON.stringify(operation.input) !== JSON.stringify(input)) throw new Error('pending_operation')
+  sessionStorage.setItem(key, JSON.stringify(operation))
+  try {
+    const result = await api(route, route === 'record' ? { project: view.project.id } : {},
+      { ...operation.input, id: operation.id })
+    sessionStorage.removeItem(key)
+    return result
+  } catch (error) {
+    if (error.status === 400) sessionStorage.removeItem(key)
+    render()
+    throw error
+  }
+}
+
+function pendingActions() {
+  return ['record', 'transfer'].flatMap(route => {
+    const saved = sessionStorage.getItem(pendingKey(route))
+    if (!saved) return []
+    const { input } = JSON.parse(saved)
+    const label = route === 'transfer' ? '账户转账' : input.label
+    return [section('上次提交结果待核对', el('p', {}, label + ' · ' + input.amount + ' 元 · ' + input.date),
+      action('核对并完成上次提交', async () => {
+        if (route === 'record') view = await postMoney(route, input)
+        else accountState = await postMoney(route, input)
+        render()
+        report('已核对并保存一笔记录')
+      }))]
+  })
+}
+
 async function record(input) {
-  const draft = loadDraft()
-  const key = JSON.stringify(input)
-  if (draft.pending?.key !== key) draft.pending = { key, id: crypto.randomUUID() }
-  view = await api('record', { project: view.project.id }, { ...input, id: draft.pending.id })
-  draft.pending = null
+  if (['receipt', 'cost', 'payment'].includes(input.kind)) {
+    view = await postMoney('record', input)
+  } else {
+    const draft = loadDraft()
+    const key = JSON.stringify(input)
+    if (draft.pending?.key !== key) draft.pending = { key, id: crypto.randomUUID() }
+    view = await api('record', { project: view.project.id }, { ...input, id: draft.pending.id })
+    draft.pending = null
+  }
   render()
   report('已保存')
   return view
@@ -479,7 +522,7 @@ function quotePanel() {
       action('查看明细', () => versionDetails(row)),
       el('a', { href: url('api/export', { project: view.project.id, quote: row.id }) }, '下载 Excel'),
       action('复制', () => startDraft(row.lines.map(line => ({ ...line, price: (line.unitCents / 100).toFixed(2) })),
-        { tax: row.tax, scope: row.scope, exclusions: row.exclusions, estimateTerms: row.estimateTerms, paymentTerms: row.paymentTerms, validUntil: '' })),
+        { purpose: row.purpose ?? 'formal', tax: row.tax, scope: row.scope, exclusions: row.exclusions, estimateTerms: row.estimateTerms, paymentTerms: row.paymentTerms, validUntil: '' })),
       !baseline && row.purpose !== 'budget' ? action('设为签约依据', () => openDialog('确认签约依据',
         form(async fields => { await record({ kind: 'baseline', quoteId: row.id, note: fields.get('note') }); modal.close() },
           field('合同编号或确认依据', 'note', { required: true }), submit('确认签约依据')))) : null)), '还没有报价，点击「新建报价」开始')),
@@ -508,14 +551,14 @@ function quoteDraft(draft) {
       localStorage.removeItem('renovation-quote:' + id)
       render()
       report(purpose === 'formal' ? '正式报价已保存，可以下载客户版' : '预算参考已保存')
-    }, select('用途', 'purpose', [['formal', '正式报价'], ['budget', '预算参考']]),
+    }, select('用途', 'purpose', [['formal', '正式报价'], ['budget', '预算参考']], draft.purpose ?? 'formal'),
     select('报价口径', 'tax', [['included', '含税'], ['excluded', '未含税']], draft.tax),
     field('有效期至（可选）', 'validUntil', { type: 'date', value: draft.validUntil ?? '' }),
     field('包含范围', 'scope', { value: draft.scope ?? '' }), field('不包含的项目', 'exclusions', { value: draft.exclusions ?? '' }),
     field(estimates ? '暂估项目如何复量结算' : '暂估说明（可选）', 'estimateTerms', { value: draft.estimateTerms ?? '' }),
     field('付款约定（可选）', 'paymentTerms', { value: draft.paymentTerms ?? '' }), submit('保存报价版本'))
     review.addEventListener('input', () => {
-      for (const [key, val] of new FormData(review)) if (key !== 'purpose') draft[key] = val
+      for (const [key, val] of new FormData(review)) draft[key] = val
       persistDraft()
     })
     return [section(null, title, el('p', { className: 'total' }, money(summary.totalCents)),
@@ -670,9 +713,8 @@ function accountPanel() {
   }, field('账户名称', 'name', { placeholder: '如 微信、现金、公司银行卡', required: true }),
   field('期初金额（可选）', 'opening', { inputMode: 'decimal' }), submit('保存账户'))), 'primary')
   const transfer = accounts.length > 1 ? action('账户转账', () => {
-    const id = crypto.randomUUID()
     openDialog('账户转账', form(async values => {
-      accountState = await api('transfer', {}, { ...Object.fromEntries(values), id })
+      accountState = await postMoney('transfer', Object.fromEntries(values))
       modal.close()
       render()
     }, select('转出账户', 'source', accountOptions), select('转入账户', 'target', accountOptions, accounts[1].id),
@@ -711,7 +753,7 @@ function render() {
   const panels = view ? { overview, quote: quotePanel, ledger: ledgerPanel, accounts: accountPanel }[tab]() :
     [section('开始管理第一个装修项目', el('p', { className: 'muted' }, '可以先做一份报价，也可以直接记一笔收支。'),
       action('创建项目', createProject, 'primary'))]
-  app.replaceChildren(masthead, nav ?? '', el('p', { className: 'notice', role: 'status' }, status), ...panels)
+  app.replaceChildren(masthead, nav ?? '', el('p', { className: 'notice', role: 'status' }, status), ...(view ? pendingActions() : []), ...panels)
 }
 
 async function init() {

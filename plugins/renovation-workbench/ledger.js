@@ -179,20 +179,35 @@ export class Ledger {
   }
 
   saveChatQuote(sessionId, operationId, input, drawings) {
-    const id = createHash('sha256').update('renovation-chat:' + sessionId).digest('hex')
+    const legacyProject = createHash('sha256').update('renovation-chat:' + sessionId).digest('hex')
+    const quoteId = createHash('sha256').update(JSON.stringify([sessionId, operationId])).digest('hex')
     const fingerprint = JSON.stringify(input)
     this.db.exec('BEGIN IMMEDIATE')
     try {
-      const records = this.records(id)
-      const earlier = records.find(record => record.id === operationId)
+      const earlier = this.db.prepare(`SELECT project, id, data FROM records WHERE kind = 'quote'
+        AND (id = ? OR (project = ? AND id = ?)) LIMIT 1`).get(quoteId, legacyProject, operationId)
       if (earlier) {
-        if (earlier.fingerprint !== fingerprint) throw new InputError('operation_conflict')
+        const { fingerprint: original, ...quote } = JSON.parse(earlier.data)
+        if (original !== fingerprint) throw new InputError('operation_conflict')
         this.db.exec('COMMIT')
-        const { fingerprint: _fingerprint, ...quote } = earlier
-        return { projectId: id, quote }
+        return { projectId: earlier.project, quote: { ...quote, id: earlier.id } }
       }
-      this.db.prepare('INSERT INTO projects VALUES (?, ?, ?) ON CONFLICT(id) DO NOTHING')
-        .run(id, requiredText(input.projectName), optionalText(input.city, 80))
+      const name = requiredText(input.projectName)
+      const city = optionalText(input.city, 80)
+      let id
+      if (input.projectId !== undefined) {
+        const project = this.project(requiredText(input.projectId, 80))
+        if (input.createProject || project.name !== name || (city && city !== project.city)) {
+          throw new InputError('project_selection_required')
+        }
+        id = project.id
+      } else {
+        if (!input.createProject && this.db.prepare('SELECT 1 FROM projects WHERE name = ?').get(name)) {
+          throw new InputError('project_selection_required')
+        }
+        id = this.create({ name, city }).id
+      }
+      const records = this.records(id)
       const saved = new Map()
       for (const drawing of drawings.values()) {
         const digest = createHash('sha256').update(drawing.bytes).digest('hex')
@@ -203,9 +218,9 @@ export class Ledger {
         scale: line.drawing.scale, metric: line.drawing.metric,
       } } : line)
       const quote = this.buildRecord(id, 'quote', { ...input, lines }, records)
-      this.db.prepare('INSERT INTO records VALUES (?, ?, ?, ?)').run(id, operationId, 'quote', JSON.stringify({ ...quote, fingerprint }))
+      this.db.prepare('INSERT INTO records VALUES (?, ?, ?, ?)').run(id, quoteId, 'quote', JSON.stringify({ ...quote, fingerprint }))
       this.db.exec('COMMIT')
-      return { projectId: id, quote: { id: operationId, ...quote } }
+      return { projectId: id, quote: { id: quoteId, ...quote } }
     } catch (error) {
       if (this.db.isTransaction) this.db.exec('ROLLBACK')
       throw error
